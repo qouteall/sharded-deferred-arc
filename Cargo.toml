@@ -1,0 +1,14 @@
+[package]
+name = "sdark"
+version = "0.1.0"
+edition = "2024"
+description = "Sharded Deferred Atomic Reference Counting"
+
+[dependencies]
+crossbeam = "0.8"
+parking_lot = "0.12"
+scopeguard = "1.2"
+log = "0.4"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
