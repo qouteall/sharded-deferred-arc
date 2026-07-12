@@ -1,3 +1,5 @@
+(This repo is work-in-progress)
+
 # Sharded-Deferred-Arc
 
 `Arc` is commonly used in Rust. But when many threads increment/decrement same atomic counter, cache contention may hurt performance.
