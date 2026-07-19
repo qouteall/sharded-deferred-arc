@@ -55,9 +55,16 @@ impl CollectorShared {
                     Ok(()) => {
                         error!("Collector main should not finish.")
                     }
-                    Err(err) => {
-                        error!("Collector panicked {err:?}");
-                        eprintln!("Collector panicked {err:?}");
+                    Err(any_err) => {
+                        let msg = if let Some(s) = any_err.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else if let Some(s) = any_err.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "non-string panic payload".to_string()
+                        };
+                        error!("Collector panicked {msg}");
+                        eprintln!("Collector panicked {msg}");
                     }
                 }
             }),
@@ -309,10 +316,27 @@ impl CollectorThreadState {
             to_re_check =
                 self.update_specific_counters_and_collect_and_get_ptrs_to_re_check(to_re_check);
 
+            // Is it possible that the inner iteration loop deadloops?
+            // The new to_re_check have elements in two cases:
+            // 1. A `Sdarc` is dropped when dropping a `SdarcInner` in collector thread
+            // 2. For a `SdarcInner` tracked by previous `to_re_check`, its counter sum is observed to be zero (then counter tags get cleared)
+            // For 1: normally the children Sdarc will be dropped in parent drop. One object dropping can cause
+            // other objects dropping. Normally there is finite objects to be dropped so it won't deadloop.
+            // What if user thread keeps allocating new Sdarc in parallel? Then it will be buffered into pending
+            // track list and won't be tracked in an inner iteration.
+            // What if user type's `drop` creates a new Sdarc and drops? It will still be not tracked immediately.
+            // For 2, it cannot have new element other than previous `to_re_check`.
+            // What if the user type drop clones an existing living Sdarc then drop?
+            // It will not cause deadloop because that Sdarc is living and the pre-check should be non-zero.
+            // What about the race condition where [0, 1] becomes [1, 1] then [1, 0]?
+            // It won't cause memory safety issue because tagged counter will be observed then it delays freeing.
+            // Then its state will become DefaultState ad won't go into to_re_check.
+            // TODO
+
             loop_counter += 1;
             if loop_counter == 100000 {
                 warn!(
-                    "Two many inner iterations in one outer iteration. It's either caused by user frees a very deep structure made of Sdarc, or there is a bug. Exiting the inner iteration loop."
+                    "Two many inner iterations in one outer iteration. It's either caused by user frees a very deep structure made of Sdarc, or there is a bug. Exiting the inner iteration loop. {to_re_check:?}"
                 );
                 break;
             }
@@ -383,6 +407,8 @@ impl CollectorThreadState {
                 }
             }
         }
+
+        self.free_pointers(&mut to_free);
 
         let to_recheck_from_thread_local =
             COLLECTOR_THREAD_LOCAL.with(|cell| cell.get().unwrap().take_to_recheck());
