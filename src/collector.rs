@@ -6,7 +6,7 @@ use crate::sharded_alloc::{FULL_SHARD_ALLOC, ShardedDataPtr};
 use crate::tagged_counter::AtomicTaggedCounter;
 use crossbeam::utils::CachePadded;
 use log::{debug, error, warn};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, DerefMut};
@@ -29,8 +29,62 @@ pub(crate) struct CollectorShared {
     /// The outer iteration runs in interval specified by [`CollectorParams::interval`]
     /// Within each outer iteration, there are inner iterations.
     /// These counters are just for logging, so use Relaxed ordering.
+    /// Outer iteration counter being zero means collection hasn't started.
     outer_iteration_counter: AtomicU64,
     inner_iteration_counter: AtomicU64,
+
+    /// The mutex and condvar is used for
+    status_mutex: Mutex<CollectorState>,
+    status_condvar: Condvar,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CollectorState {
+    Waiting { finished_iteration_counter: u64 },
+    Running { working_on_iteration_counter: u64 },
+}
+
+impl CollectorState {
+    fn to_serial_number(self) -> u64 {
+        match self {
+            CollectorState::Running {
+                working_on_iteration_counter,
+            } => working_on_iteration_counter * 2,
+            CollectorState::Waiting {
+                finished_iteration_counter,
+            } => finished_iteration_counter * 2 + 1,
+        }
+    }
+
+    /// The [`collector_update_now_and_wait`] needs to wait until one full collection.
+    /// For example, if it's currently working on iteration 3, it has to wait until iteration 4 finishes. 
+    /// If it just waits until iteration 3 finishes, the `Sdarc` whose ref count sum becomes 0 during iteration 3 may be not collected.
+    fn after_at_least_one_full_collection(self) -> CollectorState {
+        match self {
+            CollectorState::Waiting {
+                finished_iteration_counter: now_finished,
+            } => CollectorState::Waiting {
+                finished_iteration_counter: now_finished + 1,
+            },
+            CollectorState::Running {
+                working_on_iteration_counter: now_working_on,
+            } => CollectorState::Waiting {
+                finished_iteration_counter: now_working_on + 1,
+            },
+        }
+    }
+}
+
+impl Ord for CollectorState {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.to_serial_number().cmp(&other.to_serial_number())
+    }
+}
+
+impl PartialOrd for CollectorState {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 pub(crate) struct CollectorPendingDataShard {
@@ -75,6 +129,10 @@ impl CollectorShared {
             }),
             outer_iteration_counter: AtomicU64::new(0),
             inner_iteration_counter: AtomicU64::new(0),
+            status_mutex: Mutex::new(CollectorState::Waiting {
+                finished_iteration_counter: 0,
+            }),
+            status_condvar: Condvar::new(),
         }
     }
 
@@ -108,10 +166,25 @@ fn get_collector() -> &'static CollectorShared {
 ///
 /// Make collector quickly collect the objects whose reference count sum become zero.
 pub fn collector_update_now() {
-    /// Synchronizes-with the Acquire fence in collector,
-    /// ensure curr thread's ref count decrement is visible to collector after unparking
-    atomic::fence(Ordering::Release);
     get_collector().thread_handle.thread().unpark();
+    // No need to add extra memory fences. The park synchronizes-with unpark.
+}
+
+/// Interrupt the collector from parking, and wait until it finishes one full collection.
+pub fn collector_update_now_and_wait() {
+    let collector = get_collector();
+
+    let mut guard = collector.status_mutex.lock();
+
+    // unpark after holding mutex. this avoids waiting for two iterations rather than one iteration
+    collector.thread_handle.thread().unpark();
+
+    let state_when_start_waiting = *guard;
+    let state_to_wait_until = state_when_start_waiting.after_at_least_one_full_collection();
+
+    collector
+        .status_condvar
+        .wait_while(&mut guard, |curr_state| *curr_state >= state_to_wait_until);
 }
 
 struct CollectorThreadState {
@@ -473,11 +546,21 @@ fn collector_thread_main() {
         tracked_counters: BTreeMap::new(),
     };
 
+    let mut outer_iteration_counter = 0;
+
     loop {
-        // This counter is just for logging, Relaxed ordering is fine
-        let outer_iteration_counter = collector
+        outer_iteration_counter += 1;
+        collector
             .outer_iteration_counter
-            .fetch_add(1, Ordering::Relaxed);
+            .store(outer_iteration_counter, Ordering::Relaxed);
+        {
+            let mut guard = collector.status_mutex.lock();
+            *guard = CollectorState::Running {
+                working_on_iteration_counter: outer_iteration_counter,
+            };
+        }
+
+        debug!("Collector starts outer iteration {outer_iteration_counter} started");
 
         let iteration_start_time = Instant::now();
 
@@ -485,18 +568,24 @@ fn collector_thread_main() {
 
         let elapsed_time = iteration_start_time.elapsed();
 
-        debug!("Collection outer iteration {outer_iteration_counter} took {elapsed_time:?}");
+        debug!(
+            "Collection outer iteration {outer_iteration_counter} finished. Took {elapsed_time:?}"
+        );
 
         let to_wait = collector.params.interval.saturating_sub(elapsed_time);
 
         debug!("Collector thread is going to wait {to_wait:?}");
 
-        thread::park_timeout(to_wait);
+        /// Notify waiters in [`collector_update_now_and_wait`]
+        {
+            let mut guard = collector.status_mutex.lock();
+            *guard = CollectorState::Waiting {
+                finished_iteration_counter: outer_iteration_counter,
+            };
+            collector.status_condvar.notify_all();
+        }
 
-        /// Synchronizes-with Release fence in [`collector_update_now`],
-        /// ensure that reference count decrements before calling [`collector_update_now`] in caller thread
-        /// is visible to collector.
-        atomic::fence(Ordering::Acquire);
+        thread::park_timeout(to_wait);
     }
 }
 

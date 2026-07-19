@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rusty_fork::rusty_fork_test;
-
+use crate::collector::collector_update_now_and_wait;
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -523,8 +523,7 @@ fn scenario_integrated() {
     //    The SharedContext itself needs 2 passes, then its contents need
     //    another 2+ passes.
     for iteration in 0..8 {
-        collector_update_now();
-        thread::sleep(Duration::from_millis(600));
+        collector_update_now_and_wait();
         let remaining = tracked_alloc_count();
         let used = crate::sharded_alloc::total_sharded_alloc_used_slots();
         eprintln!("  cleanup iter {iteration}: tracked={remaining}, shard_slots={used}");
